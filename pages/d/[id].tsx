@@ -3,6 +3,7 @@ import { Replicache } from "replicache";
 import { M, mutators } from "../../frontend/mutators";
 import App from "../../frontend/app";
 import { createClient } from "@supabase/supabase-js";
+import { WebSQLKVStore } from "../../frontend/websql-kvstore";
 
 export default function Home() {
   const [rep, setRep] = useState<Replicache<M> | null>(null);
@@ -22,6 +23,7 @@ export default function Home() {
         pullURL: `/api/replicache-pull?spaceID=${spaceID}`,
         name: spaceID,
         mutators,
+        experimentalKVStore: new WebSQLKVStore(window, spaceID),
       });
 
       const supabase = createClient(
