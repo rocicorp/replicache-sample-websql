@@ -10,9 +10,9 @@ export class WebSQLKVStore implements ExperimentalKVStore {
     this._db = open(win, name);
   }
 
-  private _db: Promise<Database> | undefined;
+  private _db: Database | undefined;
 
-  private _getDB(): Promise<Database> {
+  private _getDB(): Database {
     if (this._db === undefined) {
       throw new Error("Database is closed");
     }
@@ -20,7 +20,7 @@ export class WebSQLKVStore implements ExperimentalKVStore {
   }
 
   async read(): Promise<ExperimentalKVRead> {
-    return new WebSQLRead(await this._getDB());
+    return new WebSQLRead(this._getDB());
   }
 
   async withRead<R>(
@@ -30,7 +30,7 @@ export class WebSQLKVStore implements ExperimentalKVStore {
   }
 
   async write(): Promise<ExperimentalKVWrite> {
-    return new WebSQLWrite(await this._getDB());
+    return new WebSQLWrite(this._getDB());
   }
 
   async withWrite<R>(
@@ -65,7 +65,7 @@ class WebSQLRead implements ExperimentalKVRead {
   async has(key: string): Promise<boolean> {
     const res = await executeSQL(
       await this._getTX(),
-      `select 1 from kv where key = ?`,
+      `select 1 from entry where key = ?`,
       [key]
     );
     return res.rows.length > 0;
@@ -74,7 +74,7 @@ class WebSQLRead implements ExperimentalKVRead {
   async get(key: string): Promise<ReadonlyJSONValue | undefined> {
     const res = await executeSQL(
       await this._getTX(),
-      `select 1 from kv where key = ?`,
+      `select value from entry where key = ?`,
       [key]
     );
     if (res.rows.length === 0) {
@@ -101,19 +101,19 @@ class WebSQLWrite extends WebSQLRead implements ExperimentalKVWrite {
     if (has) {
       await executeSQL(
         await this._getTX(),
-        `update kv set value = ? where key = ?`,
-        [key, JSON.stringify(str)]
+        `update entry set value = ? where key = ?`,
+        [key, str]
       );
     } else {
       await executeSQL(
         await this._getTX(),
-        `insert into kv (key, value) values (?, ?)`,
-        [key, JSON.stringify(str)]
+        `insert into entry (key, value) values (?, ?)`,
+        [key, str]
       );
     }
   }
   async del(key: string): Promise<void> {
-    await executeSQL(await this._getTX(), `delete from kv where key = ?`, [
+    await executeSQL(await this._getTX(), `delete from entry where key = ?`, [
       key,
     ]);
   }
@@ -123,26 +123,32 @@ class WebSQLWrite extends WebSQLRead implements ExperimentalKVWrite {
   }
 }
 
-function open(win: WindowDatabase, repName: string): Promise<Database> {
-  return new Promise((resolve) => {
-    return win.openDatabase(
-      `replicache-${repName}`,
-      "1.0",
-      "Replicache",
-      20 * 1024 * 1024,
-      async (db) => {
-        if (db === undefined) {
-          throw new Error("Failed to open database");
-        }
-        const tx = await transact(db, true);
-        tx.executeSql(
-          `create table entry if not exists (key text primary key, value text)`,
+function open(win: WindowDatabase, repName: string): Database {
+  return win.openDatabase(
+    `replicache-${repName}`,
+    "1.0",
+    "Replicache",
+    20 * 1024 * 1024,
+    async (db) => {
+      if (db === undefined) {
+        throw new Error("Failed to open database");
+      }
+      const tx = await transact(db, true);
+      // create table if not exists not supported in chrome, so have to check manually.
+      const res = await executeSQL(
+        tx,
+        `select 1 from sqlite_master where type='table' and name='entry'`,
+        undefined
+      );
+      if (res.rows.length == 0) {
+        await executeSQL(
+          tx,
+          `create table entry (key text primary key, value text)`,
           undefined
         );
-        resolve(db);
       }
-    );
-  });
+    }
+  );
 }
 
 function transact(db: Database, writeable: boolean): Promise<SQLTransaction> {
