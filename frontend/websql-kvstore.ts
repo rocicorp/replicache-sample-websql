@@ -20,7 +20,7 @@ export class WebSQLKVStore implements ExperimentalKVStore {
   }
 
   async read(): Promise<ExperimentalKVRead> {
-    return new WebSQLRead(this._getDB(), false);
+    return new WebSQLTransaction(this._getDB(), false);
   }
 
   async withRead<R>(
@@ -30,7 +30,7 @@ export class WebSQLKVStore implements ExperimentalKVStore {
   }
 
   async write(): Promise<ExperimentalKVWrite> {
-    return new WebSQLWrite(this._getDB());
+    return new WebSQLTransaction(this._getDB(), true);
   }
 
   async withWrite<R>(
@@ -48,9 +48,12 @@ export class WebSQLKVStore implements ExperimentalKVStore {
   }
 }
 
-class WebSQLRead implements ExperimentalKVRead {
+class WebSQLTransaction implements ExperimentalKVRead {
   private _tx: Promise<SQLTransaction> | undefined;
-  private _committed = false;
+  private _cache: Map<
+    string,
+    { value: ReadonlyJSONValue | undefined; dirty: boolean }
+  > = new Map();
 
   constructor(db: Database, writeable: boolean) {
     this._tx = transact(db, writeable);
@@ -64,82 +67,64 @@ class WebSQLRead implements ExperimentalKVRead {
   }
 
   async has(key: string): Promise<boolean> {
-    const res = await executeSQL(
-      await this._getTX(),
-      `select 1 from entry where k = ?`,
-      [key]
-    );
-    return res.rows.length > 0;
+    return (await this.get(key)) !== undefined;
   }
 
   async get(key: string): Promise<ReadonlyJSONValue | undefined> {
+    const cacheEntry = this._cache.get(key);
+    if (cacheEntry !== undefined) {
+      return cacheEntry.value;
+    }
+
     const res = await executeSQL(
       await this._getTX(),
       `select v from entry where k = ?`,
       [key]
     );
-    if (res.rows.length === 0) {
-      return undefined;
-    }
-    return JSON.parse(res.rows.item(0).v);
+
+    const value =
+      res.rows.length === 0 ? undefined : JSON.parse(res.rows.item(0).v);
+    this._cache.set(key, { value, dirty: false });
+    return value;
   }
 
   get closed(): boolean {
     return this._tx === undefined;
   }
 
-  release(): void {
-    this._tx = undefined;
-  }
-}
-
-class WebSQLWrite extends WebSQLRead implements ExperimentalKVWrite {
-  private _pending: Map<string, ReadonlyJSONValue | undefined> = new Map();
-
-  constructor(db: Database) {
-    super(db, true);
-  }
-
-  async has(key: string): Promise<boolean> {
-    if (this._pending.has(key)) {
-      return this._pending.get(key) !== undefined;
-    }
-    return super.has(key);
-  }
-
-  async get(key: string): Promise<ReadonlyJSONValue | undefined> {
-    if (this._pending.has(key)) {
-      return this._pending.get(key)!;
-    }
-    return super.get(key);
-  }
-
   async put(key: string, value: ReadonlyJSONValue): Promise<void> {
     console.log("put", key, value);
-    this._pending.set(key, value);
+    this._cache.set(key, { value, dirty: true });
   }
 
   async del(key: string): Promise<void> {
     console.log("del", key);
-    this._pending.set(key, undefined);
+    this._cache.set(key, { value: undefined, dirty: true });
+  }
+
+  release(): void {
+    this._tx = undefined;
   }
 
   async commit(): Promise<void> {
     const tx = await this._getTX();
-    console.log("committing pending list", this._pending);
+    console.log("committing pending list", this._cache);
     await Promise.all(
-      [...this._pending.entries()].map(async ([key, value]) => {
-        console.log("committing", key, value);
-        if (value === undefined) {
-          await executeSQL(tx, `delete from entry where k = ?`, [key]);
-        } else {
-          await executeSQL(
-            tx,
-            `insert or replace into entry (k, v) values (?, ?)`,
-            [key, JSON.stringify(value)]
-          );
-        }
-      })
+      [...this._cache.entries()]
+        .filter(([, entry]) => entry.dirty)
+        .map(async ([key, entry]) => {
+          const { value } = entry;
+          console.log("committing", key, value);
+          if (value === undefined) {
+            await executeSQL(tx, `delete from entry where k = ?`, [key]);
+          } else {
+            await executeSQL(
+              tx,
+              `insert or replace into entry (k, v) values (?, ?)`,
+              [key, JSON.stringify(value)]
+            );
+          }
+        })
     );
   }
 }
