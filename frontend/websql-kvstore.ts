@@ -20,7 +20,7 @@ export class WebSQLKVStore implements ExperimentalKVStore {
   }
 
   async read(): Promise<ExperimentalKVRead> {
-    return new WebSQLRead(this._getDB());
+    return new WebSQLRead(this._getDB(), false);
   }
 
   async withRead<R>(
@@ -50,9 +50,10 @@ export class WebSQLKVStore implements ExperimentalKVStore {
 
 class WebSQLRead implements ExperimentalKVRead {
   private _tx: Promise<SQLTransaction> | undefined;
+  private _committed = false;
 
-  constructor(db: Database) {
-    this._tx = transact(db, false);
+  constructor(db: Database, writeable: boolean) {
+    this._tx = transact(db, writeable);
   }
 
   protected _getTX(): Promise<SQLTransaction> {
@@ -65,7 +66,7 @@ class WebSQLRead implements ExperimentalKVRead {
   async has(key: string): Promise<boolean> {
     const res = await executeSQL(
       await this._getTX(),
-      `select 1 from entry where key = ?`,
+      `select 1 from entry where k = ?`,
       [key]
     );
     return res.rows.length > 0;
@@ -74,13 +75,13 @@ class WebSQLRead implements ExperimentalKVRead {
   async get(key: string): Promise<ReadonlyJSONValue | undefined> {
     const res = await executeSQL(
       await this._getTX(),
-      `select value from entry where key = ?`,
+      `select v from entry where k = ?`,
       [key]
     );
     if (res.rows.length === 0) {
       return undefined;
     }
-    return JSON.parse(res.rows.item(0).value);
+    return JSON.parse(res.rows.item(0).v);
   }
 
   get closed(): boolean {
@@ -93,33 +94,53 @@ class WebSQLRead implements ExperimentalKVRead {
 }
 
 class WebSQLWrite extends WebSQLRead implements ExperimentalKVWrite {
-  async put(key: string, value: ReadonlyJSONValue): Promise<void> {
-    // TODO: would be better to use upsert probably:
-    // https://www.sqlite.org/lang_UPSERT.html
-    const has = await this.has(key);
-    const str = JSON.stringify(value);
-    if (has) {
-      await executeSQL(
-        await this._getTX(),
-        `update entry set value = ? where key = ?`,
-        [key, str]
-      );
-    } else {
-      await executeSQL(
-        await this._getTX(),
-        `insert into entry (key, value) values (?, ?)`,
-        [key, str]
-      );
-    }
+  private _pending: Map<string, ReadonlyJSONValue | undefined> = new Map();
+
+  constructor(db: Database) {
+    super(db, true);
   }
+
+  async has(key: string): Promise<boolean> {
+    if (this._pending.has(key)) {
+      return this._pending.get(key) !== undefined;
+    }
+    return super.has(key);
+  }
+
+  async get(key: string): Promise<ReadonlyJSONValue | undefined> {
+    if (this._pending.has(key)) {
+      return this._pending.get(key)!;
+    }
+    return super.get(key);
+  }
+
+  async put(key: string, value: ReadonlyJSONValue): Promise<void> {
+    console.log("put", key, value);
+    this._pending.set(key, value);
+  }
+
   async del(key: string): Promise<void> {
-    await executeSQL(await this._getTX(), `delete from entry where key = ?`, [
-      key,
-    ]);
+    console.log("del", key);
+    this._pending.set(key, undefined);
   }
 
   async commit(): Promise<void> {
-    // nothing to do
+    const tx = await this._getTX();
+    console.log("committing pending list", this._pending);
+    await Promise.all(
+      [...this._pending.entries()].map(async ([key, value]) => {
+        console.log("committing", key, value);
+        if (value === undefined) {
+          await executeSQL(tx, `delete from entry where k = ?`, [key]);
+        } else {
+          await executeSQL(
+            tx,
+            `insert or replace into entry (k, v) values (?, ?)`,
+            [key, JSON.stringify(value)]
+          );
+        }
+      })
+    );
   }
 }
 
@@ -143,7 +164,7 @@ function open(win: WindowDatabase, repName: string): Database {
       if (res.rows.length == 0) {
         await executeSQL(
           tx,
-          `create table entry (key text primary key, value text)`,
+          `create table entry (k text primary key, v text)`,
           undefined
         );
       }
@@ -164,6 +185,7 @@ function executeSQL(
   args: ObjectArray | undefined
 ): Promise<SQLResultSet> {
   return new Promise(async (res, rej) => {
+    console.log(`executing sql: ${sql}`, args);
     tx.executeSql(
       sql,
       args,
@@ -171,6 +193,7 @@ function executeSQL(
         res(result);
       },
       (_, err) => {
+        console.error(`Error executing sql: ${sql}`, err, args);
         rej(err);
         return true;
       }
